@@ -1,0 +1,20 @@
+# Never add local FLOP miner secrets or generated runtime artifacts
+miner.env
+.env
+.env.*
+signer
+miner.json
+*.seed
+*.key
+session-keys/
+audit-key/
+models/
+worker-data/
+patches/
+cloudflared.deb
+flop-miner-key.json
+*.log
+*.bak
+*.bak-*
+*.tmp
+.DS_Store
