@@ -44,6 +44,15 @@ docker compose --env-file ../miner.env -f ../docker-compose.yml \
 
 Beklenen `false/true`. Gerçek bir `fenced: true` durumunda **kilit dosyasını elle silmeyin**.
 
+## Bilgisayar açıldı, miner çalışıyor ama ödeme yok (14.11.2026)
+
+**Gerçek vakamız:** Docker ve Cloudflare ayaktaydı, fakat worker'ın kanıt yüklemesi `da.register failed` ile takıldı ve `/session/info-proof` üzerinden `ready: false` döndü. Süresi dolmuş kanal zincirde `computeChannel.TimedOutRefunded` ile kapatıldıktan ve worker yeniden başlatıldıktan sonra `ready: true` doğrulandı. **Bu, tek başına yeni ödeme geldiğini kanıtlamaz.**
+
+**İlk kontrol:** `docker compose ... ps`, `fence-guard/status.mjs` ve **POST** `/session/info-proof` ile durumu doğrulayın. `ready: null` belirsizdir; dışarıdan `401` yalnızca erişimin çalıştığını gösterir. `fenced: true` iken güvenlik kilidini elle silmeyin veya imzalı işlem başlatmayın.
+
+**Adım adım güvenli düzeltme, hazır komutlar ve dikkat edilmesi gerekenler:**
+[14 Kasım 2026 — restart sonrası `ready: false` / takılı kanal](HATALAR-VE-COZUMLER.md) başlığını açın. **Süresi dolmamış kanala `--send` göndermeyin**; kapatma ücretlidir ve escrow alıcıya iade edilir. `ready: true` sonrasında gerçek ödemeyi ayrıca Explorer'da `computeChannel.settle` ile kontrol edin.
+
 ## Kalibrasyon / Ghost işlerini izle
 
 ```bash
