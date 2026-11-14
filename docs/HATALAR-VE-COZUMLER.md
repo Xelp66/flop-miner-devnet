@@ -391,6 +391,133 @@ docker compose --env-file ../miner.env -f ../docker-compose.yml \
 
 `fenced: true` ise sistemin zincirce güvenli olduğunu doğrulamasını bekleyin. Rehberde `BLOCKED, needs a person` durumunda **elle dosya silmeyin**; [upstream hata yönergelerine](https://github.com/UfukNode/flop-miner-setup/blob/main/Turkce-Kurulum.md) bakın.
 
+
+### 14 Kasım 2026: Bilgisayar yeniden açıldıktan sonra ödeme yok, `da.register failed`, worker `ready: false`
+
+**Gerçek olay (Windows 11 + WSL2 + Docker Desktop, worker v0.1.336):** Bilgisayar kapatılıp açıldıktan sonra konteynerler çalışıyor, GPU/model doğrulanıyor, Cloudflare tüneline erişiliyor; ancak miner yeni ücretli oturumları tamamlamıyordu. Bu olayda **takılı kalmış, süresi dolmuş bir kanalı zincirde kapattıktan ve worker'ı başlattıktan sonra** `/session/info-proof` tekrar **`ready: true`** döndü. Bu işlem görev kabul edebilme durumunu düzeltti; sonraki kazançların/ödemenin gerçekleştiği ayrıca `settle` ile doğrulanmalıdır.
+
+**Gördüğümüz işaretler:**
+
+- Worker logunda `[session] turn 0 g_n=132 unacked=132 toploc=yes` vardı: GPU gerçekten işlem yapmıştı.
+- Aynı kanalın kanıt gönderimi `"phase":"da.register","status":"failed"` ile yaklaşık **55 saniye** sonra başarısız oldu.
+- Ardından `miner signer is fenced`, `ready: false` ve zaman zaman `/session/info` isteğinde 20 saniyelik timeout görüldü.
+- Fence Guard logunda `no fence file found; leaving it` vardı. Daha sonra kilit sorgusu `fenced: false` döndü; **kilidin kalkması tek başına worker'ın hazır olduğu anlamına gelmedi.**
+- `fence-guard/status.mjs` çıktısındaki `ready: null`, gerçek `false` demek değildir: Bu betik `/session/info` hatasını yakalayıp `null` yazabilir.
+- `/session/info` adresine **yetkisiz** HTTP isteği `401` döndü: Port erişilebilir; fakat bu **hazır/ödeme alabilir** anlamına gelmez.
+- Tek bir RPC `chain_getFinalizedHead` denemesi başarılıydı (yaklaşık 1,8 sn); bu aralıklı RPC hatalarını dışlamaz. Önceki saatlerde `1006 Abnormal Closure` kopmaları da görülmüştü.
+- Cloudflare Quick Tunnel adresi yeniden başlatmada değişebilir. Bizde duyurulan adres dışarıdan `401` döndü; bu olayın kesin nedeninin Cloudflare olduğu **gösterilmedi**.
+
+#### 1. Önce konteyner, kilit ve gerçek hazır olma durumuna bakın
+
+Komutların tamamı **Ubuntu / WSL terminalinde** çalışır:
+
+```bash
+cd /opt/flop-miner
+docker compose --env-file miner.env -f docker-compose.yml ps
+docker ps --format 'table {{.Names}}\t{{.Status}}' | grep -E 'NAMES|flop-miner'
+
+# İmzalama kilidi: false beklenir; ready:null kesin hazır-değil kararı değildir
+docker compose --env-file miner.env -f docker-compose.yml \
+  exec -T worker node --input-type=module < fence-guard/status.mjs \
+  | jq '{fenced,ready}'
+```
+
+**Kesin hazır olma testi:** `/session/info-proof` için **GET değil POST** kullanın; GET `404` döner ve bu bir arıza değildir. Token'ı ekrana basmadan worker içinden test:
+
+```bash
+cd /opt/flop-miner
+docker compose --env-file miner.env -f docker-compose.yml exec -T worker node -e '
+const start=Date.now();
+fetch("http://127.0.0.1:8645/session/info-proof",{
+  method:"POST",
+  headers:{Authorization:"Bearer "+process.env.SESSION_AUTH_TOKEN,
+           "Content-Type":"application/json"},
+  body:JSON.stringify({challenge:require("node:crypto").randomBytes(32).toString("hex")}),
+  signal:AbortSignal.timeout(20000)
+}).then(async r=>{
+  const d=await r.json();
+  console.log(JSON.stringify({http:r.status,ready:d.ready,error:d.error||null,ms:Date.now()-start},null,2))
+}).catch(e=>console.log("HATA:",e.message))
+'
+```
+
+`http: 200` ile birlikte `ready: true` beklenir. `ready: false` ise önce gerçek nedenini bulmadan tekrar tekrar worker restart yapmayın.
+
+**Eğer `fenced: true` ise:** Önce `sudo systemctl start flop-fence-guard.service` ve `sudo tail -20 /opt/flop-miner/fence-guard/guard.log` ile güvenli uzlaşmayı kontrol edin. Gerekli imzalı işlem akıbeti kesinleşmeden **fence dosyasını silmeyin, zorla kilidi açmayın, yeniden signer oluşturmayın**. Kilit devam ediyorsa aşağıdaki imzalı kanal kapatma adımına geçmeyin.
+
+#### 2. Başarısız kanıt yüklemesine bağlı *takılı kanalı* tespit edin
+
+```bash
+cd /opt/flop-miner
+docker compose --env-file miner.env -f docker-compose.yml logs --since=24h worker \
+  | grep -E '"phase":"da\.(register|reconstruct)","status":"failed"|miner signer is fenced' \
+  | tail -20
+```
+
+Hata satırındaki `channelId` değerini alın. **Başka miner'a ait veya farklı durumdaki bir kanalı kapatmayın.** Bizim olayda kanal kimliği `0x5aeab42765b8dce43901ad59efe3fbf285f3a477c7aa9be7d24dd05fc9d19bd8` idi; bu **geçmişe ait örnektir, yeni olayda aynısını kullanmayın**.
+
+Upstream'in `close-expired.mjs` aracı, kanalı zincirde okuyup sahipliği, durumu ve bitiş bloğunu doğrular. İlk çalışma **sadece kontrol (dry-run)** yapar:
+
+```bash
+cd /opt/flop-miner
+install -d -m 755 tools
+curl -fsSL -o tools/close-expired.mjs \
+  https://raw.githubusercontent.com/UfukNode/flop-miner-setup/main/tools/close-expired.mjs
+# Güvenlik için indirdiğiniz betiğin içeriğini inceleyin:
+less tools/close-expired.mjs
+
+# AŞAĞIDAKİ DEĞERİ YENİ HATALI OTURUMUN channelId'Sİ İLE DEĞİŞTİRİN:
+ID=0xBURAYA_64_HEX_KARAKTERLIK_KANAL_KIMLIGI
+CLI=$(grep '^FLOP_CLI=' miner.env | cut -d= -f2-)
+docker run --rm --network host -v /opt/flop-miner:/work:ro \
+  --entrypoint node "$CLI" /work/tools/close-expired.mjs "$ID"
+```
+
+Yalnızca `open and expired ... can be closed` mesajı alındığında ve **`fenced: false` doğrulandığında** bir sonraki adıma geçin. `open until block ...` ise henüz süresi dolmamıştır, imzalı kapatma yapmayın. Ücret, ağ koşullarına göre değişir; bizim olayda tahmini **0,0085 test FLOP** idi.
+
+#### 3. Worker'ı durdurun, süre aşımı işlemini gönderin, yeniden başlatın
+
+`--send` **gerçek zincir işlemi imzalar**, kapanan kanalın escrow tutarını alıcıya iade eder ve miner hesabından işlem ücreti tahsil eder. İşlem, ücretli bir oturumun miner'a ödeme yapmasını sağlamaz; süresi dolan ve zaten bloke olmuş kanalı kapatmaya yarar.
+
+```bash
+cd /opt/flop-miner
+# EŞ ZAMANLI imzalamayı engellemek için worker'ı durdurun
+sudo flock -w 15 /run/flop-fence-guard.lock \
+  docker compose --env-file /opt/flop-miner/miner.env \
+  -f /opt/flop-miner/docker-compose.yml stop worker
+
+# $ID ve $CLI değişkenleri 2. adımdan gelmiş olmalı.
+# Yalnızca doğruladığınız süresi dolmuş kanalı kapatın:
+sudo flock -w 15 /run/flop-fence-guard.lock \
+  docker run --rm --network host -v /opt/flop-miner:/work:ro \
+  --entrypoint node "$CLI" /work/tools/close-expired.mjs --send "$ID"
+
+# Başarı: closed (computeChannel.TimedOutRefunded)
+docker compose --env-file miner.env -f docker-compose.yml up -d worker
+```
+
+Bizde görülen **başarılı** on-chain çıktı: `closed (computeChannel.TimedOutRefunded)`. Bu çıktı gelmezse işlemin gerçekleştiğini varsaymayın, tekrar `--send` çalıştırmadan önce zincir durumuna bakın.
+
+#### 4. Düzeldiğini doğrulayın
+
+- Worker yeniden açılırken geçici `fetch failed` olabilir; `docker compose ... ps worker` ve son açılış logunda `Session host listening on :8645` bekleyin. Tekrar tekrar restart yapmayın.
+- Yukarıdaki **POST /session/info-proof** testi `http: 200, ready: true` dönmeli. **Bizde kapatma ve worker başlatma sonrasında bu durum doğrulandı.**
+- Cloudflare adresini kontrol edin; ücretsiz Quick Tunnel adresinin değişmesi **tek başına sorun değildir**. Tunnel Watch güncel `SESSION_PUBLIC_HOST` adresini worker'a duyurmalıdır:
+
+```bash
+cd /opt/flop-miner
+HOST=$(grep '^SESSION_PUBLIC_HOST=' miner.env | cut -d= -f2-)
+echo "Tünel: https://$HOST"
+curl -sS --max-time 15 -o /dev/null -w 'Cloudflare HTTP: %{http_code}\n' \
+  "https://$HOST/session/info"
+```
+
+`401` dış erişimin çalıştığını gösterir; **ödeme yapıldığını kanıtlamaz**. Nihai ödeme doğrulaması için worker logunda `[session] settle cooperative` veya Explorer'da `computeChannel.settle` başarılı işlemi bulunmalıdır.
+
+**Yapmayın:** `docker compose down -v`, `docker system prune`, worker veri/kanıt deposu veya signer/fence dosyalarını elle silme, aynı kanala belirsiz şekilde tekrar tekrar `--send` gönderme. Bunun her PC açılışında mutlaka yaşanacağı doğrulanmadı; bu vaka yeniden başlatma **sonrasında gözlendi**, kesin kök nedenin WSL/Cloudflare olduğu gösterilmedi.
+
+**Kaynak:** [UfukNode — RPC kesintisi sonrasında worker hazır değil / süresi dolan kanalı kapatma](https://github.com/UfukNode/flop-miner-setup/blob/main/Turkce-Kurulum.md) (rehberin sorun giderme bölümü).
+
 ### `V2 leaf cannot bind a TOPLOC activation commitment (fail closed)`
 
 Kaynak rehberde bu hata `SESSION_COMMIT_IDS` eksikliğine bağlanıyor. Güncel `docker-compose.yml` dosyamızda `SESSION_COMMIT_IDS: "1"` var. Kontrol:
